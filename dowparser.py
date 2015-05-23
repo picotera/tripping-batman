@@ -13,39 +13,29 @@ def replaceAbsolute(cont):
     ''' Replace absolute resource paths with relative ones, so the website could be viewed offline '''
     return REPLACE_ABSOLUTE_PATT.sub(replaceAbsoluteFunc, cont)
 
-def getSearchResults(cont):
-    ''' Get the html of the search results '''
-    result = ''
-    cont = replaceAbsolute(cont)
-    soup = BeautifulSoup(cont)
-    matches = soup.find(id='grdSearch').find_all('tr')[1:-1]    
-    for match in matches:
-        result += match.prettify()
-        
-    return result
-
 def getPageUrls(cont):
     ''' Get the search page urls (1-2-...whatever) '''
     print 'Finding urls'
     soup = BeautifulSoup(cont)
-    pages = soup.find(id='divResultsTable').table.tr.span.find_all('a')
+    pages_span = soup.find(id='divResultsTable').table.tr.span
+    
+    if pages_span == None:
+        return []
+    pages = pages_span.find_all('a')
     
     page_urls = []
     for page in pages:
         page_urls.append(page['href'])
         
-    return page_urls
-
-def getRecordUrls(cont):
-    ''' Get the records needed for this page to function offline '''
-    result = ASPX_PATT.findall(cont)
-    return result
-
+    return page_urls    
+    
 def getRecordData(cont):
     ''' Fetch the id of the record and the relevant html elements and return them. '''
-    cont = replaceAbsolute(cont)
+    # If needed, replace absolute links.
+    #cont = replaceAbsolute(cont)
     soup = BeautifulSoup(cont)
-    id = soup.find(id='lblProfileIdText').text
+    
+    #id = soup.find(id='lblProfileIdText').text
     
     elem = soup.find(id='divRecordView')
     if elem == None:
@@ -57,11 +47,9 @@ def getRecordData(cont):
     for e in elems:
         data += e.prettify()
         
-    return id, data
-        
-# The below code parses the pages better, but currently not needed.
-"""
-# A language option that's in the name hover function, maybe useful later
+    return data
+
+    # A language option that's in the name hover function, maybe useful later
 RESULT_LANGUAGE = { '1': 'English',
                     '2': 'Spanish',
                     '4': 'French',
@@ -74,7 +62,7 @@ RESULT_LANGUAGE = { '1': 'English',
 
 WORD_PATT = re.compile('([\w]+)')
 HOVER_TEXT_PATT = re.compile('ShowHoverText\(event,(.+?)\);')
-    
+
 def getText(propertyName):
     
     def __getText(soup):
@@ -126,9 +114,9 @@ NORMAL_HANDLERS = { 0: parseAttr('attr1'), # Those 3 are attributes of the entit
                     5: getText('title'),
                     6: getText('subsidiary'),
                     7: getText('match') }
-def parseNormal(soup):
-    ''' WORKED FINE '''
+def parseNormal(cont):
     print 'Parsing page'
+    soup = BeautifulSoup(cont)
     results = []
     
     matches = soup.find('table', id='grdSearch').find_all('tr')[1:-1]
@@ -141,6 +129,35 @@ def parseNormal(soup):
         results.append(result_data)
         
     return results
+
+"""
+def getSearchResults(cont):
+    ''' Get the html of the search results '''
+    result = ''
+    cont = replaceAbsolute(cont)
+    soup = BeautifulSoup(cont)
+    matches = soup.find(id='grdSearch').find_all('tr')[1:-1]    
+    for match in matches:
+        result += match.prettify()
+        
+    return result
+
+def getPageUrls(cont):
+    ''' Get the search page urls (1-2-...whatever) '''
+    print 'Finding urls'
+    soup = BeautifulSoup(cont)
+    pages = soup.find(id='divResultsTable').table.tr.span.find_all('a')
+    
+    page_urls = []
+    for page in pages:
+        page_urls.append(page['href'])
+        
+    return page_urls
+
+def getRecordUrls(cont):
+    ''' Get the records needed for this page to function offline '''
+    result = ASPX_PATT.findall(cont)
+    return result
 
 # A dictionary for parsing people search records
 RELATIVES_HANDLERS = { 0: parseAttr('attr1'), # Those 3 are attributes of the entity.. not sure each one means

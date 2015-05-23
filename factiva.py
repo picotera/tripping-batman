@@ -3,19 +3,23 @@ import re
 from bs4 import BeautifulSoup
 import json
 from datetime import datetime
-import traceback
-import dowparser
 import os
 import os.path
-import helper
 import logging
-import shutil
+from ConfigParser import SafeConfigParser
+from Queue import Queue
 
 import requests.utils
 import pprint
 
-# Turn down requests logging
+import pygres
+import rabbitcoat
+import dowparser
+from helper import *
+
+# Turn down requests and pika logging
 logging.getLogger("requests").setLevel(logging.WARNING)
+logging.getLogger("pika").setLevel(logging.WARNING)
 
 HTML_STRUCTURE = '<html><head><meta charset="UTF-8"></head><body>%s</body>'
 
@@ -149,42 +153,69 @@ def copyForm(form):
     for input in inputs:
         if input['type'] == 'hidden' and input.has_attr('value'):
             data[input['name']] = input['value']
-        
-    # All in all this should give us a sessionId and login to dow jones
-    pprint.pprint(data)
     
     return data
 
 MAIN_URL = 'https://djrc.dowjones.com/'
 SEARCH_MAIN_ID = 'grdSearch'
+SOURCE_FORMAT = 'factiva'
 
+OUTPUT_DIR = 'output/'
+
+DEFAULT_CONFIG = 'settings.ini'
+
+FACTIVA_SECTION = 'FACTIVA'
+
+# Can inherit Thread if needed
 class DowJones(object):
     
-    def __init__(self):
-        self.logger = helper.getLogger(logging.INFO)
-        self.config = helper.Config()
+    def __init__(self, config='conf/factiva.conf', rabbit_config='conf/rabbitcoat.conf', pygres_config='conf/pygres.conf'):
+        self.logger = getLogger('factiva')
+        self.logger.info('Initializing factiva')
+        
+        self.db_articles = pygres.PostgresArticles()
+        
+        self.__loadConfig(config)
         
         self.s = requests.session()
         
         self.s.headers = HEADERS
         
-    def Login(self):
-        ''' Login into dowjones '''    
+        self.queries = Queue()
+        self.sender = self.sender = rabbitcoat.RabbitSender(self.logger, rabbit_config, self.out_queue)
+        
+        # Login to dowjones
+        self.__login()
+        
+        self.receiver = rabbitcoat.RabbitReceiver(self.logger, rabbit_config, self.in_queue, self.__rabbitCallback)
+        self.receiver.start()
+    
+    def __loadConfig(self, config):
+        parser = SafeConfigParser()
+        parser.read(config)
+        self.username = parser.get(FACTIVA_SECTION, 'username')
+        self.password = parser.get(FACTIVA_SECTION, 'password')
+        self.in_queue = parser.get(FACTIVA_SECTION, 'in_queue')
+        self.out_queue = parser.get(FACTIVA_SECTION, 'out_queue')
+    
+    def __login(self):
+        ''' Login into dowjones '''
+        self.logger.info('Logging into dowjones...')
+        
         login_url = 'https://djlogin.dowjones.com/login.asp?productname=rnc'
         
-        p1 = re.compile('Payload: (.+)};')
-        p2 = re.compile("(\w+):'")
-        
         data = {
-            'LoginEmailId': self.config.username,
-            'UserPassword': self.config.password
+            'LoginEmailId': self.username,
+            'UserPassword': self.password
         }
         res = self.s.post(login_url, data)
         
-        self.BrowserLogin()
+        self.__browserLogin()
     
-    def BrowserLogin(self):
+    def __browserLogin(self):
         ''' Perform a different login to imitate browser behavior '''
+        print 'new'
+        self.logger.info('Imitating browser behavior...')
         browser_login = 'http://djlogin.dowjones.com/rnc/default.aspx'
         
         res = self.s.get(browser_login)
@@ -195,18 +226,35 @@ class DowJones(object):
         data = copyForm(soup.form)
         
         res = self.s.post(ref, data)
+    
+    def __getRecords(self, query, records):
+        results = [] 
+        for record in records:
+            record_url = record['url']
+            
+            self.logger.debug('Getting  record %s' %record_url)
+            res = self.s.get(MAIN_URL + record_url)
+            if res.status_code != 200:
+                self.logger.error('Failed to get record %s' %record)
+            
+            # Find the record data
+            data = dowparser.getRecordData(res.text)
+            
+            id = self.db_articles.AddArticle(data, ArticleSources.FACTIVA)
+            #id = 1
+            
+            # url is irrelevant here, since it changes constantly.
+            results.append({ SOURCE_KEY: SOURCE_FORMAT,
+                             ID_KEY: id,
+                             QUERY_KEY: query,
+                             TITLE_KEY: record['name'],})
         
+        return results
+    
     def Query(self, query):
-        ''' Search dow jones and download the results recursively '''
+        ''' Search dow jones and get the relevant records '''
         
         search_url = 'searchcriteria.aspx'
-        
-        search_cont = ''
-        
-        # Create the output directory
-        output_dir = '%s/%s/' %(self.config.output_dir, query) 
-        if not os.path.exists(output_dir):
-            os.makedirs(output_dir)
         
         # Query for page specific parameters(like event validation and stuff)
         param_res = self.s.get(MAIN_URL + search_url)
@@ -223,10 +271,13 @@ class DowJones(object):
         # Query the first page and save the result
         res = self.s.post(MAIN_URL + search_url, data)
         
-        search_cont += dowparser.getSearchResults(res.text)
-        
-        # Get search result pages
         page_urls = dowparser.getPageUrls(res.text)
+        # No results
+        if len(page_urls) == 0:
+            return []
+        
+        pages = []
+        pages.append(res.text)
         # Skip the first page since we got it already
         for url in page_urls[1:]:
             res = self.s.get(MAIN_URL + url)
@@ -234,32 +285,40 @@ class DowJones(object):
                 self.logger.error('Failed to get search page %s')
             
             # Add the search results to the main content
-            search_cont += dowparser.getSearchResults(res.text)
+            pages.append(res.text)
         
-        # Get the records and change the names
-        records = dowparser.getRecordUrls(search_cont)
-        for record in records:
-            record_url = record.replace(r'&amp;', '&')
-            self.logger.info('Getting %s' %record_url)
-            res = self.s.get(MAIN_URL + record_url)
-            if res.status_code != 200:
-                self.logger.error('Failed to search page %s' %record)
-            
-            # Find the record data
-            id, data = dowparser.getRecordData(res.text)
-            filename = '%s.html' %id      
-            search_cont = search_cont.replace(record, filename)
-            
-            html_data = HTML_STRUCTURE %data
-            open('%s%s' %(output_dir, filename), 'w').write(html_data.encode('utf8'))
+        records = dowparser.parsePages(pages)
+        results = self.__getRecords(query, records)
         
-        search_page = HTML_STRUCTURE %('<table>%s</table>' %search_cont)
-        open('%ssearch.html' %(output_dir), 'w').write(search_page.encode('utf8'))
+        return results
+        
+    def __sendResults(self, results):
+        self.logger.debug('Sending results to manager')
+        self.sender.Send(results, corr_id = self.corr_id)
+    
+    def __rabbitCallback(self, data, properties):
+        name = data[NAME_PARAM]
+        # Ignore the original name for now, since dowjones seems to translate it to English anyway.
+        origin_name = data.get(ORIGIN_NAME_PARAM)
+        
+        self.queries.put((name, properties.correlation_id))        
+    
+    def run(self):
+        self.logger.info('Starting main query loop')
+        
+        while True:
+            # Since only one query is running at a time, self.corr_id is fine
+            query, self.corr_id = self.queries.get()
+            self.logger.info('Starting query %s' %query)
+            results = self.Query(query)
+            
+            self.logger.info('Sending query results %s to %s' %(query, self.out_queue))
+            #TODO: Remove this
+            self.__sendResults(results)
 
 def main():
     jones = DowJones()
-    jones.Login()
-    jones.Query('Alex Margolin')
+    jones.run()
     
 if __name__ == '__main__':
     main()
