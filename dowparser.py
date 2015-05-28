@@ -45,8 +45,9 @@ def getRecordData(cont):
     elems = elem.parent.find_all('div', recursive=False)
     
     for e in elems:
-        data += e.prettify()
+        data += str(e)
         
+    # Return a string object that can be saved to the DB
     return data
 
     # A language option that's in the name hover function, maybe useful later

@@ -3,11 +3,10 @@ import re
 from bs4 import BeautifulSoup
 import json
 from datetime import datetime
-import os
-import os.path
 import logging
 from ConfigParser import SafeConfigParser
 from Queue import Queue
+import time
 
 import requests.utils
 import pprint
@@ -166,6 +165,8 @@ DEFAULT_CONFIG = 'settings.ini'
 
 FACTIVA_SECTION = 'FACTIVA'
 
+LOGIN_INTERVAL = 15*60
+
 # Can inherit Thread if needed
 class DowJones(object):
     
@@ -173,7 +174,7 @@ class DowJones(object):
         self.logger = getLogger('factiva')
         self.logger.info('Initializing factiva')
         
-        self.db_articles = pygres.PostgresArticles()
+        self.db_articles = pygres.PostgresArticles(self.logger, pygres_config)
         
         self.__loadConfig(config)
         
@@ -184,8 +185,9 @@ class DowJones(object):
         self.queries = Queue()
         self.sender = self.sender = rabbitcoat.RabbitSender(self.logger, rabbit_config, self.out_queue)
         
-        # Login to dowjones
-        self.__login()
+        self.last_login = 0
+        # Give it some time to get the lock
+        time.sleep(2)
         
         self.receiver = rabbitcoat.RabbitReceiver(self.logger, rabbit_config, self.in_queue, self.__rabbitCallback)
         self.receiver.start()
@@ -200,6 +202,11 @@ class DowJones(object):
     
     def __login(self):
         ''' Login into dowjones '''
+        if time.time() - self.last_login < LOGIN_INTERVAL:
+            return
+        
+        self.last_login = time.time()
+        
         self.logger.info('Logging into dowjones...')
         
         login_url = 'https://djlogin.dowjones.com/login.asp?productname=rnc'
@@ -214,7 +221,6 @@ class DowJones(object):
     
     def __browserLogin(self):
         ''' Perform a different login to imitate browser behavior '''
-        print 'new'
         self.logger.info('Imitating browser behavior...')
         browser_login = 'http://djlogin.dowjones.com/rnc/default.aspx'
         
@@ -234,6 +240,7 @@ class DowJones(object):
             
             self.logger.debug('Getting  record %s' %record_url)
             res = self.s.get(MAIN_URL + record_url)
+            
             if res.status_code != 200:
                 self.logger.error('Failed to get record %s' %record)
             
@@ -250,9 +257,11 @@ class DowJones(object):
                              TITLE_KEY: record['name'],})
         
         return results
-    
-    def Query(self, query):
+
+    def __query(self, query):
         ''' Search dow jones and get the relevant records '''
+        
+        self.__login()
         
         search_url = 'searchcriteria.aspx'
         
@@ -310,7 +319,8 @@ class DowJones(object):
             # Since only one query is running at a time, self.corr_id is fine
             query, self.corr_id = self.queries.get()
             self.logger.info('Starting query %s' %query)
-            results = self.Query(query)
+            
+            results = self.__query(query)
             
             self.logger.info('Sending query results %s to %s' %(query, self.out_queue))
             #TODO: Remove this
