@@ -247,7 +247,7 @@ class DowJones(object):
             # Find the record data
             data = dowparser.getRecordData(res.text)
             
-            id = self.db_articles.AddArticle(data, ArticleSources.FACTIVA)
+            id = self.db_articles.AddArticle(data, SearchEngines.FACTIVA)
             #id = 1
             
             # url is irrelevant here, since it changes constantly.
@@ -301,8 +301,13 @@ class DowJones(object):
         
         return results
         
-    def __sendResults(self, results):
-        self.logger.debug('Sending results to manager')
+    def __sendResults(self, results, error=None):
+        '''Sends the results to the next gear.'''
+        if error:
+            results = {ERROR_KEY: error}
+        else:
+            results = {RESULTS_KEY: results}
+            
         self.sender.Send(results, corr_id = self.corr_id)
     
     def __rabbitCallback(self, data, properties):
@@ -320,7 +325,11 @@ class DowJones(object):
             query, self.corr_id = self.queries.get()
             self.logger.info('Starting query %s' %query)
             
-            results = self.__query(query)
+            try:
+                results = self.__query(query)
+            except Exception:
+                self.logger.exception('Exception in run')
+                self.__sendResults(None, error='Exception while fetching results')
             
             self.logger.info('Sending query results %s to %s' %(query, self.out_queue))
             #TODO: Remove this
